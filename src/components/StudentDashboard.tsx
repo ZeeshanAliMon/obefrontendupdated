@@ -219,12 +219,20 @@ const normalizeStudentCourse = (sc: any, matchingLocalCourse: any, regToUse: str
   });
 
   const rawObeMarks = sc.obeMarks || sc.obe_marks || matchingLocalCourse?.obeMarks || matchingLocalCourse?.obe_marks || {};
-  const rawStudents = matchingLocalCourse?.students || sc.students || [];
+  const rawStudents = sc.students || matchingLocalCourse?.students || [];
   
   const matchedStudent = rawStudents.find((s: any) => normalizeRegNo(s.regNo || s.reg_no) === normalizeRegNo(regToUse));
-  const studentMarks = { ...(matchedStudent?.marks || matchedStudent?.obtained_marks || matchedStudent?.obtainedMarks || sc.studentMarks || sc.student_marks || sc.marks || sc.obtained_marks || sc.obtainedMarks || {}) };
+  
+  // Prefer fresh server-side student marks first!
+  const serverMarks = sc.studentMarks || sc.student_marks || sc.marks || sc.obtained_marks || sc.obtainedMarks || null;
+  const studentMarks = {
+    ...(matchedStudent?.marks || matchedStudent?.obtained_marks || matchedStudent?.obtainedMarks || {}),
+    ...(serverMarks || {})
+  };
 
-  const studentObeMarks = rawObeMarks[regToUse] || rawObeMarks[normalizeRegNo(regToUse)] || {};
+  const matchedObeKey = Object.keys(rawObeMarks).find(k => normalizeRegNo(k) === normalizeRegNo(regToUse));
+  const studentObeMarks = matchedObeKey ? rawObeMarks[matchedObeKey] : {};
+  
   Object.entries(studentObeMarks).forEach(([qId, score]) => {
     const matchingQ = normalizedObeQuestions.find(q => q.id === qId);
     if (matchingQ) {
@@ -336,6 +344,7 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
   const [studentGA, setStudentGA] = useState<any>(null);
   const [finalTranscripts, setFinalTranscripts] = useState<any[]>([]);
   const [semesterPlans, setSemesterPlans] = useState<any[]>([]);
+  const [courseCLOMappings, setCourseCLOMappings] = useState<Record<string, { code: string; mappedGA: string | null }[]>>({});
 
   // UI States
   const [expandedCourseCode, setExpandedCourseCode] = useState<string | null>(null);
@@ -595,14 +604,14 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
       // Try to match the student's program first
       const matchByProgram = semesterPlans.find(p => 
         p.programId === studentProgramId && 
-        p.courseCodes?.some((c: string) => c.trim().toUpperCase() === courseCode.trim().toUpperCase())
+        p.courseCodes?.some((c: string) => c.trim().toUpperCase().replace(/[- ]/g, '') === courseCode.trim().toUpperCase().replace(/[- ]/g, ''))
       );
       if (matchByProgram) {
         return matchByProgram.semester;
       }
       // If not matched by student's program, try any plan
       const matchAny = semesterPlans.find(p => 
-        p.courseCodes?.some((c: string) => c.trim().toUpperCase() === courseCode.trim().toUpperCase())
+        p.courseCodes?.some((c: string) => c.trim().toUpperCase().replace(/[- ]/g, '') === courseCode.trim().toUpperCase().replace(/[- ]/g, ''))
       );
       if (matchAny) {
         return matchAny.semester;
@@ -659,7 +668,7 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
   // This guarantees high-fidelity, complete visuals for all courses instead of all empty tables.
   const computeStudentCourseResult = (stdRegNo: string, courseCode: string) => {
     // Look up if there is an Instructor Course with these marks
-    const instCourse = instructorCourses.find(ic => ic.code === courseCode);
+    const instCourse = instructorCourses.find(ic => ic.code.trim().toUpperCase().replace(/[- ]/g, '') === courseCode.trim().toUpperCase().replace(/[- ]/g, ''));
     const std = instCourse?.students.find(s => normalizeRegNo(s.regNo) === normalizeRegNo(stdRegNo));
 
     let aggregate = 0;
@@ -818,6 +827,9 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
     const marks = instCourse?.obeMarks || {};
     const cloCount = instCourse?.cloCount || 4;
 
+    const matchedObeKey = Object.keys(marks).find(k => normalizeRegNo(k) === normalizeRegNo(stdRegNo));
+    const studentObeMarks = matchedObeKey ? marks[matchedObeKey] : {};
+
     computedCLOs = Array.from({ length: cloCount }, (_, i) => `CLO-${i + 1}`).map((clo, idx) => {
       const cloQs = qs.filter(q => q.mappedCLOs.includes(clo));
       let max = 0;
@@ -825,21 +837,11 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
       
       cloQs.forEach(q => {
         max += q.maxMarks;
-        score += marks[stdRegNo]?.[q.id] ?? 0;
+        score += studentObeMarks?.[q.id] ?? 0;
       });
 
-      // Standard stable simulation if no OBE structures are customized yet
+      // If no questions are mapped to this CLO, it is unassessed.
       if (max === 0) {
-        if (hasAnyMarks && aggregate > 0) {
-          // If the course has been graded, estimate attainment based on overall aggregate
-          // to stay consistent with the QA Dashboard and provide complete indicators.
-          const simulatedPercent = Math.min(100, Math.max(0, Math.round(aggregate + (Math.sin(idx + clo.charCodeAt(clo.length - 1)) * 3))));
-          return {
-            code: clo,
-            percentage: simulatedPercent,
-            status: simulatedPercent >= 50 ? 'Attained' : 'Needs Improvement'
-          };
-        }
         return {
           code: clo,
           percentage: 0,
@@ -867,11 +869,14 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
   // Get student's enrolled courses with dynamic calculations attached
   const enrolledCoursesWithGrades = useMemo(() => {
     const studentCodes = studentBindings
-      .filter(b => b.studentRegNo === activeRegNo)
-      .map(b => b.courseCode);
+      .filter(b => normalizeRegNo(b.studentRegNo) === normalizeRegNo(activeRegNo))
+      .map(b => b.courseCode.trim().toUpperCase().replace(/[- ]/g, ''));
     
     const matched = courses
-      .filter(c => studentCodes.includes(c.code))
+      .filter(c => {
+        const normalizedCode = c.code.trim().toUpperCase().replace(/[- ]/g, '');
+        return studentCodes.includes(normalizedCode);
+      })
       .map(c => {
         const results = computeStudentCourseResult(activeRegNo, c.code);
         return {
@@ -889,6 +894,62 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
       return true;
     });
   }, [courses, studentBindings, activeRegNo, instructorCourses]);
+
+  useEffect(() => {
+    if (enrolledCoursesWithGrades.length === 0) return;
+
+    let active = true;
+    const fetchCLOMappings = async () => {
+      const mappings: Record<string, { code: string; mappedGA: string | null }[]> = {};
+      
+      // Populate with default fallback mappings first (CLO-1 maps to GA-1, CLO-2 to GA-2, etc.)
+      enrolledCoursesWithGrades.forEach(c => {
+        const defaultCLOs = Array.from({ length: c.results?.clos?.length || c.cloCount || 4 }, (_, i) => ({
+          code: `CLO-${i + 1}`,
+          mappedGA: `GA-${i + 1}`
+        }));
+        mappings[c.code.toUpperCase()] = defaultCLOs;
+      });
+
+      // Fetch actual mappings from database
+      const promises = enrolledCoursesWithGrades.map(async (c) => {
+        try {
+          const localSavedCoursesStr = localStorage.getItem('IQRA_OBE_INSTRUCTOR_COURSES');
+          const localSavedCourses: InstructorCourse[] = localSavedCoursesStr ? JSON.parse(localSavedCoursesStr) : [];
+          const matchingLocalCourse = localSavedCourses.find((lc: any) => lc.code.trim().toLowerCase() === c.code.trim().toLowerCase());
+          
+          let dbCLOs: any[] = [];
+          try {
+            if (c.id) {
+              dbCLOs = await apiService.getCourseCLOs(c.id);
+            }
+          } catch (apiErr) {
+            console.warn(`Failed to fetch CLOs from backend for course ${c.code}`, apiErr);
+          }
+
+          if (Array.isArray(dbCLOs) && dbCLOs.length > 0) {
+            mappings[c.code.toUpperCase()] = dbCLOs.map((cloObj: any) => ({
+              code: cloObj.code || cloObj.clo_code || '',
+              mappedGA: cloObj.mappedGA || cloObj.mapped_ga || null
+            }));
+          }
+        } catch (err) {
+          console.warn(`Failed to process CLOs for course ${c.code}`, err);
+        }
+      });
+
+      await Promise.all(promises);
+      
+      if (active) {
+        setCourseCLOMappings(mappings);
+      }
+    };
+
+    fetchCLOMappings();
+    return () => {
+      active = false;
+    };
+  }, [enrolledCoursesWithGrades]);
 
   // Group enrolled courses by Semester
   const coursesBySemester = useMemo(() => {
@@ -1047,31 +1108,37 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
   // Compute Graduate Attribute (GA) Attainment scores dynamically
   // Each GA is mapped to courses. We aggregate the student's aggregate marks in those courses.
   const gaAttainmentProfile = useMemo(() => {
-    if (studentGA && Array.isArray(studentGA.attainments)) {
-      const list = studentGA.attainments.map((att: any) => ({
-        id: att.gaId,
-        name: att.gaTitle,
-        description: att.gaDescription || `Competency and standard metrics for ${att.gaTitle}`,
-        score: att.score || 0,
-        contributingCount: att.contributingCourses?.length || 0,
-        coursesList: (att.contributingCourses || []).map((c: any) => `${c.code} - ${c.title}`)
-      }));
-      return [...list].sort((a, b) => naturalCompare(a.id, b.id));
-    }
-
     const list = programGAs.map(ga => {
-      // Find courses that are mapped to this GA
-      const contributingCourses = enrolledCoursesWithGrades.filter(c => 
-        Array.isArray(c.mappedGAs) && c.mappedGAs.some(mg => matchGA(mg, ga.id))
-      );
-
       let sumPercentage = 0;
       let count = 0;
+      const contributingCoursesSet = new Set<string>();
 
-      contributingCourses.forEach(c => {
-        if (c.results && c.results.aggregate !== undefined && c.results.aggregate > 0) {
-          sumPercentage += c.results.aggregate;
-          count++;
+      enrolledCoursesWithGrades.forEach(c => {
+        const cCode = c.code.toUpperCase();
+        // Check if we have CLO-to-GA mappings for this course
+        const mappings = courseCLOMappings[cCode] || [];
+        
+        // Find if any CLO in this course maps to this GA
+        const mappedCLOsInCourse = mappings.filter(m => m.mappedGA && matchGA(m.mappedGA, ga.id));
+        
+        if (mappedCLOsInCourse.length > 0) {
+          let courseCLOSum = 0;
+          let courseCLOCount = 0;
+
+          mappedCLOsInCourse.forEach(m => {
+            const cloResult = c.results?.clos?.find((r: any) => r.code.toUpperCase() === m.code.toUpperCase());
+            // Only count if the CLO is assessed (status is not 'Not Assessed')
+            if (cloResult && cloResult.status !== 'Not Assessed') {
+              courseCLOSum += cloResult.percentage;
+              courseCLOCount++;
+            }
+          });
+
+          if (courseCLOCount > 0) {
+            sumPercentage += (courseCLOSum / courseCLOCount);
+            count++;
+            contributingCoursesSet.add(`${c.code} - ${c.title}`);
+          }
         }
       });
 
@@ -1084,11 +1151,11 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
         ...ga,
         score: Math.round(finalScore * 10) / 10,
         contributingCount: count,
-        coursesList: contributingCourses.map(c => `${c.code} - ${c.title}`)
+        coursesList: Array.from(contributingCoursesSet)
       };
     });
     return [...list].sort((a, b) => naturalCompare(a.id, b.id));
-  }, [programGAs, enrolledCoursesWithGrades, activeRegNo, studentGA]);
+  }, [programGAs, enrolledCoursesWithGrades, activeRegNo, studentGA, courseCLOMappings]);
 
   // Aggregate Course Learning Outcomes (CLO) for the selected filter course
   const filteredCLOList = useMemo(() => {
@@ -1113,7 +1180,7 @@ export default function StudentDashboard({ onLogout, studentRegNo }: StudentDash
 
   // Helper to retrieve detailed marks breakdown for expanded views
   const getCourseMarksBreakdown = (courseCode: string) => {
-    const instCourse = instructorCourses.find(ic => ic.code === courseCode);
+    const instCourse = instructorCourses.find(ic => ic.code.trim().toUpperCase().replace(/[- ]/g, '') === courseCode.trim().toUpperCase().replace(/[- ]/g, ''));
     const std = instCourse?.students.find(s => normalizeRegNo(s.regNo) === normalizeRegNo(activeRegNo));
     
     if (!instCourse || !std || !std.marks) {
